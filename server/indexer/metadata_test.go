@@ -31,6 +31,12 @@ func (*metadataVectorStore) Clear() error { return nil }
 
 func (*metadataVectorStore) Close() error { return nil }
 
+func (s *metadataVectorStore) BeginReindex() (vectorstore.ReindexStore, error) { return s, nil }
+
+func (*metadataVectorStore) Commit() error { return nil }
+
+func (*metadataVectorStore) Rollback() error { return nil }
+
 func requireIndexMetadata(t *testing.T, idx bleve.Index, want indexMetadata) {
 	t.Helper()
 	got, complete, err := readIndexMetadata(idx)

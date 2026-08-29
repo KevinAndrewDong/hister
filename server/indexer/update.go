@@ -145,6 +145,8 @@ func (i *Indexer) UpdateByQuery(
 	changes servertypes.DocumentChanges,
 	dryRun bool,
 ) (servertypes.UpdateDocumentsResult, error) {
+	i.reindexMu.RLock()
+	defer i.reindexMu.RUnlock()
 	result := servertypes.UpdateDocumentsResult{}
 	if err := normalizeDocumentChanges(&changes); err != nil {
 		return result, err
@@ -201,28 +203,38 @@ func (i *Indexer) UpdateByQuery(
 	for start := 0; start < len(pending); start += updatePageSize {
 		end := min(start+updatePageSize, len(pending))
 		batch := newMultiBatch(i)
-		for _, update := range pending[start:end] {
-			d := update.document
-			state := i.getStoredDocumentState(d.ID())
-			plan, err := i.prepareStorageWrite(d, state)
-			if err != nil {
-				return result, fmt.Errorf("prepare update for %s: %w", d.URL, err)
+		pageErr := func() error {
+			if batch.generation != i.reindexGeneration.Load() {
+				return errors.New("reindex is in progress")
 			}
-			plan.needsEmbedding = update.embeddingContextDirty && i.embedder != nil && i.vectorStore != nil
-			if err := batch.applyDocumentWrite(d, plan); err != nil {
-				return result, fmt.Errorf("stage update for %s: %w", d.URL, err)
+			batch.mutationLocked = true
+			defer func() {
+				batch.mutationLocked = false
+			}()
+			for _, update := range pending[start:end] {
+				d := update.document
+				state := i.getStoredDocumentState(d.ID())
+				plan, err := i.prepareStorageWrite(d, state)
+				if err != nil {
+					return fmt.Errorf("prepare update for %s: %w", d.URL, err)
+				}
+				plan.needsEmbedding = update.embeddingContextDirty && i.embedder != nil && i.vectorStore != nil
+				if err := batch.applyDocumentWrite(d, plan); err != nil {
+					return fmt.Errorf("stage update for %s: %w", d.URL, err)
+				}
+				if update.originalID != d.ID() {
+					batch.deleteLocked(update.originalID)
+					result.OwnershipChanges = append(result.OwnershipChanges, servertypes.DocumentOwnershipChange{
+						URL:        d.URL,
+						FromUserID: update.originalUserID,
+						ToUserID:   d.UserID,
+					})
+				}
 			}
-			if update.originalID != d.ID() {
-				batch.Delete(update.originalID)
-				result.OwnershipChanges = append(result.OwnershipChanges, servertypes.DocumentOwnershipChange{
-					URL:        d.URL,
-					FromUserID: update.originalUserID,
-					ToUserID:   d.UserID,
-				})
-			}
-		}
-		if err := batch.Save(); err != nil {
-			return result, fmt.Errorf("save document updates: %w", err)
+			return batch.saveLocked()
+		}()
+		if pageErr != nil {
+			return result, fmt.Errorf("save document updates: %w", pageErr)
 		}
 	}
 	return result, nil

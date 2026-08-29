@@ -51,11 +51,14 @@ type Indexer struct {
 	indexers          map[string]bleve.Index // default and language specific indexers
 	indexesMu         sync.RWMutex           // protects idx, indexers, and indexesClosed
 	indexCreationMu   sync.Mutex             // serializes index creation, close, and adoption
+	lifecycleMu       sync.Mutex             // serializes Reindex and Close
+	reindexMu         sync.RWMutex           // serializes reindex publication with mutations
 	indexesClosed     bool
 	dir               string
 	data              *dataStore
 	langDetector      document.LanguageDetector
 	reindexInProgress atomic.Bool
+	reindexGeneration atomic.Uint64
 	embedder          *vectorstore.Embedder
 	vectorStore       vectorstore.VectorStore
 	embedCtx          context.Context
@@ -63,6 +66,7 @@ type Indexer struct {
 	embeddingQueue    *embeddingQueue
 	embeddingWorkers  int
 	disablePreviews   bool
+	detectLanguages   bool
 	keepStopwords     bool
 	directories       []*config.Directory
 	maxFileSize       int64
@@ -270,13 +274,16 @@ func (s storedDocumentState) embeddingTextChanged(text string) bool {
 }
 
 type MultiBatch struct {
-	indexer             *Indexer
-	batches             map[string]*indexBatch
-	orphanedHTMLKeys    []string
-	orphanedFaviconKeys []string
-	embeddingIDs        map[string]struct{}
-	deletedIDs          map[string]struct{}
-	incrementAddCount   bool
+	indexer              *Indexer
+	batches              map[string]*indexBatch
+	orphanedHTMLKeys     []string
+	orphanedFaviconKeys  []string
+	embeddingIDs         map[string]struct{}
+	deletedIDs           map[string]struct{}
+	incrementAddCount    bool
+	failOnEmbeddingError bool
+	generation           uint64
+	mutationLocked       bool
 }
 
 func (i *Indexer) searchIndexes(req *bleve.SearchRequest) (*bleve.SearchResult, error) {
@@ -425,12 +432,13 @@ func initializeIndexer(basePath string, detectLanguages, keepStopwords bool, emb
 		indexers: map[string]bleve.Index{
 			defaultIndexerName: idx,
 		},
-		dir:           basePath,
-		keepStopwords: keepStopwords,
-		embedCtx:      embedCtx,
-		embedCancel:   embedCancel,
-		data:          newDataStore(filepath.Join(basePath, dataDirName)),
-		maxFileSize:   defaultMaxFileSize,
+		dir:             basePath,
+		detectLanguages: detectLanguages,
+		keepStopwords:   keepStopwords,
+		embedCtx:        embedCtx,
+		embedCancel:     embedCancel,
+		data:            newDataStore(filepath.Join(basePath, dataDirName)),
+		maxFileSize:     defaultMaxFileSize,
 	}
 	initialized := false
 	defer func() {
@@ -583,6 +591,48 @@ func (i *Indexer) Reindex(rules *config.Rules, skipSensitiveChecks bool, detectL
 	return i.ReindexContext(context.Background(), rules, skipSensitiveChecks, detectLanguages, keepStopwords, dirs)
 }
 
+func publishReindexIndexes(basePath, tmpBasePath string, oldIndexes, newIndexes map[string]bleve.Index) (func() error, error) {
+	backupPath := filepath.Join(tmpBasePath, "old")
+	if err := os.MkdirAll(backupPath, os.ModePerm); err != nil {
+		return nil, fmt.Errorf("create reindex backup path: %w", err)
+	}
+	movedOld := make([]string, 0, len(oldIndexes))
+	movedNew := make([]string, 0, len(newIndexes))
+	restored := false
+	restore := func() error {
+		if restored {
+			return nil
+		}
+		restored = true
+		var restoreErrs []error
+		for n := len(movedNew) - 1; n >= 0; n-- {
+			if err := os.RemoveAll(filepath.Join(basePath, movedNew[n])); err != nil {
+				restoreErrs = append(restoreErrs, fmt.Errorf("remove replacement index %s: %w", movedNew[n], err))
+			}
+		}
+		for n := len(movedOld) - 1; n >= 0; n-- {
+			name := movedOld[n]
+			if err := os.Rename(filepath.Join(backupPath, name), filepath.Join(basePath, name)); err != nil {
+				restoreErrs = append(restoreErrs, fmt.Errorf("restore index %s: %w", name, err))
+			}
+		}
+		return errors.Join(restoreErrs...)
+	}
+	for name := range oldIndexes {
+		if err := os.Rename(filepath.Join(basePath, name), filepath.Join(backupPath, name)); err != nil {
+			return restore, fmt.Errorf("move index %s to reindex backup: %w", name, err)
+		}
+		movedOld = append(movedOld, name)
+	}
+	for name := range newIndexes {
+		if err := os.Rename(filepath.Join(tmpBasePath, name), filepath.Join(basePath, name)); err != nil {
+			return restore, fmt.Errorf("publish replacement index %s: %w", name, err)
+		}
+		movedNew = append(movedNew, name)
+	}
+	return restore, nil
+}
+
 // ReindexContext rebuilds indexes while honoring caller cancellation.
 func (i *Indexer) ReindexContext(ctx context.Context, rules *config.Rules, skipSensitiveChecks bool, detectLanguages, keepStopwords bool, dirs []*config.Directory) error {
 	return i.reindex(ctx, i.dir, rules, skipSensitiveChecks, detectLanguages, keepStopwords, dirs)
@@ -592,6 +642,11 @@ func (idx *Indexer) reindex(ctx context.Context, basePath string, rules *config.
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	// TODO store new documents in both indexes while running reindex to guarantee not losing any data.
+	if !idx.reindexInProgress.CompareAndSwap(false, true) {
+		return errors.New("Reindex is already running")
+	}
+	defer idx.reindexInProgress.Store(false)
 	var embeddingFingerprint string
 	if idx.vectorStore != nil && idx.embedder != nil {
 		embeddingFingerprint = idx.semanticConfig.EmbeddingFingerprint()
@@ -603,20 +658,25 @@ func (idx *Indexer) reindex(ctx context.Context, basePath string, rules *config.
 		}
 		embeddingFingerprint = metadata.EmbeddingFingerprint
 	}
-	// TODO store new documents in both indexes while running reindex to guarantee not losing any data.
-	if !idx.reindexInProgress.CompareAndSwap(false, true) {
-		return errors.New("Reindex is already running")
-	}
+	idx.lifecycleMu.Lock()
+	idx.reindexGeneration.Add(1)
 	workers := idx.embeddingWorkers
 	queueStopped := false
+	if idx.embeddingQueue != nil {
+		idx.stopEmbeddingQueue()
+		queueStopped = true
+	}
+	idx.reindexMu.Lock()
 	oldIndexClosed := false
 	defer func() {
-		idx.reindexInProgress.Store(false)
 		if retErr != nil && queueStopped && !oldIndexClosed && idx.embeddingQueue == nil {
 			if err := idx.startEmbeddingQueue(workers); err != nil {
 				retErr = errors.Join(retErr, fmt.Errorf("restart embedding queue: %w", err))
 			}
 		}
+		idx.reindexGeneration.Add(1)
+		idx.reindexMu.Unlock()
+		idx.lifecycleMu.Unlock()
 	}()
 	tmpBasePath := filepath.Join(basePath, "reindex")
 	if _, err := os.Stat(tmpBasePath); err == nil {
@@ -642,34 +702,46 @@ func (idx *Indexer) reindex(ctx context.Context, basePath string, rules *config.
 	// content-addressed files written during reindex are immediately usable
 	// after the rename step. No data directory rename is needed.
 	tmpIdx.data = idx.data
-	if idx.embeddingQueue != nil {
-		idx.stopEmbeddingQueue()
-		queueStopped = true
-	}
-
-	// Carry the vector store and embedder into the temporary indexer so that
-	// MultiBatch.Add() re-embeds every surviving document.  The vector store is
-	// rebuilt in-place (no temp-dir / rename dance is needed because it is a
-	// separate file from the Bleve indexes).
+	// Carry the embedder into the temporary indexer and write vectors to an
+	// isolated store. The live vectors remain searchable until the replacement
+	// indexes and all embeddings are ready.
 	vs := idx.vectorStore
 	embedder := idx.embedder
-	if vs != nil && embedder != nil {
-		if err := vs.Clear(); err != nil {
-			log.Warn().Err(err).Msg("failed to clear vector store before reindex")
-		} else {
-			tmpIdx.vectorStore = vs
-			tmpIdx.embedder = embedder
-		}
-	}
+	var stagedVS vectorstore.ReindexStore
+	var rollbackPublication func() error
 	abortReindex := func(err error) error {
+		if stagedVS != nil {
+			if rerr := stagedVS.Rollback(); rerr != nil {
+				err = errors.Join(err, fmt.Errorf("rollback vector store reindex: %w", rerr))
+			}
+			stagedVS = nil
+		}
+		if rollbackPublication != nil {
+			if rerr := rollbackPublication(); rerr != nil {
+				err = errors.Join(err, fmt.Errorf("restore replacement indexes: %w", rerr))
+			}
+			rollbackPublication = nil
+		}
 		// The live indexer still owns the shared vector store when reindexing
-		// aborts. Do not let closing the temporary indexer close that store.
+		// aborts. Do not let closing the temporary indexer close either store.
 		tmpIdx.vectorStore = nil
 		tmpIdx.Close()
+		if idx.vectorStore == nil && vs != nil {
+			idx.vectorStore = vs
+		}
 		if rerr := os.RemoveAll(tmpBasePath); rerr != nil {
 			log.Warn().Err(rerr).Msg("failed to clean up temp index path")
 		}
 		return err
+	}
+	if vs != nil && embedder != nil {
+		var err error
+		stagedVS, err = vs.BeginReindex()
+		if err != nil {
+			return abortReindex(fmt.Errorf("begin vector store reindex: %w", err))
+		}
+		tmpIdx.vectorStore = stagedVS
+		tmpIdx.embedder = embedder
 	}
 	q := query.NewMatchAllQuery()
 	var total uint64
@@ -701,11 +773,15 @@ func (idx *Indexer) reindex(ctx context.Context, basePath string, rules *config.
 				req.SetSearchAfter(sortKey)
 			}
 			res, err := subIdx.Search(req)
-			if err != nil || len(res.Hits) < 1 {
+			if err != nil {
+				return abortReindex(fmt.Errorf("search reindex source %s: %w", subIdxName, err))
+			}
+			if len(res.Hits) < 1 {
 				break
 			}
 			n := len(res.Hits)
 			b := newMultiBatch(tmpIdx)
+			b.failOnEmbeddingError = stagedVS != nil
 			for _, h := range res.Hits {
 				d := idx.resFromHit(h, resultIncludeAll)
 				if d.Type == document.Local {
@@ -777,34 +853,76 @@ func (idx *Indexer) reindex(ctx context.Context, basePath string, rules *config.
 	}
 	closeExtraSources()
 	idx.vectorStore = nil // prevent Close() from closing the store we're still using
-	idx.Close()
+	idx.closeIndexes()
 	oldIndexClosed = true
 	tmpIdx.vectorStore = nil // already referenced by vs; prevent double-close
 	tmpIdx.Close()
-	for n := range sourceIndexes {
-		idxPath := filepath.Join(basePath, n)
-		if err := os.RemoveAll(idxPath); err != nil {
-			return err
+	recoverOld := func(reindexErr error) error {
+		restoreFailed := false
+		if stagedVS != nil {
+			if rerr := stagedVS.Rollback(); rerr != nil {
+				reindexErr = errors.Join(reindexErr, fmt.Errorf("rollback vector store reindex: %w", rerr))
+			}
+			stagedVS = nil
 		}
-	}
-	var renameError error
-	for n := range tmpIdx.indexes() {
-		idxPath := filepath.Join(basePath, n)
-		tmpIdxPath := filepath.Join(tmpBasePath, n)
-		if err := os.Rename(tmpIdxPath, idxPath); err != nil {
-			renameError = err
+		if rollbackPublication != nil {
+			if rerr := rollbackPublication(); rerr != nil {
+				restoreFailed = true
+				reindexErr = errors.Join(reindexErr, fmt.Errorf("restore replacement indexes: %w", rerr))
+			}
+			rollbackPublication = nil
 		}
+		if restoreFailed {
+			return reindexErr
+		}
+		recovered, rerr := initializeIndexer(basePath, idx.detectLanguages, idx.keepStopwords, embeddingFingerprint)
+		if rerr != nil {
+			return errors.Join(reindexErr, fmt.Errorf("restore original indexer: %w", rerr))
+		}
+		recovered.maxFileSize = idx.maxFileSize
+		recovered.sensitivePattern = idx.sensitivePattern
+		recovered.semanticConfig = idx.semanticConfig
+		idx.adopt(recovered)
+		oldIndexClosed = false
+		idx.disablePreviews = tmpIdx.disablePreviews
+		idx.directories = dirs
+		if vs != nil && embedder != nil {
+			idx.vectorStore = vs
+			idx.embedder = embedder
+			if workers > 0 {
+				if rerr := idx.startEmbeddingQueue(workers); rerr != nil {
+					reindexErr = errors.Join(reindexErr, fmt.Errorf("restart embedding queue: %w", rerr))
+				} else {
+					queueStopped = false
+				}
+			}
+		}
+		if rerr := os.RemoveAll(tmpBasePath); rerr != nil {
+			return errors.Join(reindexErr, fmt.Errorf("clean up reindex path: %w", rerr))
+		}
+		return reindexErr
 	}
-	if renameError != nil {
-		return errors.New("failed to rename tmp indexes during the reindex, resolve the issue manually")
+	rollbackPublication, err = publishReindexIndexes(basePath, tmpBasePath, sourceIndexes, tmpIdx.indexes())
+	if err != nil {
+		return recoverOld(err)
 	}
 	replacement, err := initializeIndexer(basePath, detectLanguages, keepStopwords, embeddingFingerprint)
 	if err != nil {
-		return err
+		return recoverOld(err)
 	}
 	replacement.maxFileSize = idx.maxFileSize
 	replacement.sensitivePattern = idx.sensitivePattern
 	replacement.semanticConfig = idx.semanticConfig
+	if stagedVS != nil {
+		if err := stagedVS.Commit(); err != nil {
+			commitErr := fmt.Errorf("commit vector store reindex: %w", err)
+			replacement.Close()
+			return recoverOld(commitErr)
+		}
+		vs = stagedVS
+		stagedVS = nil
+	}
+	rollbackPublication = nil
 	idx.adopt(replacement)
 	// Restore settings that are not part of the index state.
 	idx.disablePreviews = tmpIdx.disablePreviews
@@ -945,6 +1063,14 @@ func documentEmbeddingContext(d *document.Document) vectorstore.DocumentContext 
 // can retry them. Synchronous callers may ignore the error and continue Bleve
 // indexing.
 func embedDocumentChunks(ctx context.Context, idx *Indexer, d *document.Document) error {
+	return embedDocumentChunksWithLock(ctx, idx, d, true)
+}
+
+func embedDocumentChunksLocked(ctx context.Context, idx *Indexer, d *document.Document) error {
+	return embedDocumentChunksWithLock(ctx, idx, d, false)
+}
+
+func embedDocumentChunksWithLock(ctx context.Context, idx *Indexer, d *document.Document, lockVectorStore bool) error {
 	start := time.Now()
 	chunks, err := idx.embedder.ChunkAndEmbed(ctx, d.Text, documentEmbeddingContext(d))
 	if err != nil {
@@ -957,6 +1083,10 @@ func embedDocumentChunks(ctx context.Context, idx *Indexer, d *document.Document
 	}
 	if len(chunks) == 0 {
 		return nil
+	}
+	if lockVectorStore {
+		idx.reindexMu.RLock()
+		defer idx.reindexMu.RUnlock()
 	}
 	if err := idx.vectorStore.PutChunks(d.ID(), d.UserID, chunks); err != nil {
 		log.Warn().Err(err).Str("url", d.URL).Msg("vector store write failed")
@@ -1062,6 +1192,8 @@ func (i *Indexer) AddDocument(d *document.Document) error {
 // AddDocumentContext indexes a document while honoring caller cancellation
 // during document processing.
 func (i *Indexer) AddDocumentContext(ctx context.Context, d *document.Document) error {
+	i.reindexMu.RLock()
+	defer i.reindexMu.RUnlock()
 	return i.addDocument(ctx, d, true, i.applyDocumentWrite)
 }
 
@@ -1346,6 +1478,8 @@ func (i *Indexer) prepareForStorage(d *document.Document) error {
 
 // Saves a document without any processing
 func (i *Indexer) Save(d *document.Document) error {
+	i.reindexMu.RLock()
+	defer i.reindexMu.RUnlock()
 	return i.save(d)
 }
 
@@ -1401,7 +1535,15 @@ func (i *Indexer) addIndexer(name, lang string) error {
 }
 
 func (i *Indexer) Close() {
+	i.lifecycleMu.Lock()
+	defer i.lifecycleMu.Unlock()
 	i.stopEmbeddingQueue()
+	i.reindexMu.Lock()
+	defer i.reindexMu.Unlock()
+	i.closeIndexes()
+}
+
+func (i *Indexer) closeIndexes() {
 	if i.embedCancel != nil {
 		i.embedCancel()
 	}
@@ -1448,6 +1590,7 @@ func (i *Indexer) adopt(replacement *Indexer) {
 	i.embeddingQueue = replacement.embeddingQueue
 	i.embeddingWorkers = replacement.embeddingWorkers
 	i.disablePreviews = replacement.disablePreviews
+	i.detectLanguages = replacement.detectLanguages
 	i.keepStopwords = replacement.keepStopwords
 	i.directories = replacement.directories
 	i.maxFileSize = replacement.maxFileSize
@@ -1468,6 +1611,7 @@ func newMultiBatch(idx *Indexer) *MultiBatch {
 		embeddingIDs:      make(map[string]struct{}),
 		deletedIDs:        make(map[string]struct{}),
 		incrementAddCount: false,
+		generation:        idx.reindexGeneration.Load(),
 	}
 }
 
@@ -1487,6 +1631,18 @@ func (b *MultiBatch) Add(d *document.Document) error {
 // AddContext stages a document while honoring caller cancellation during
 // document processing.
 func (b *MultiBatch) AddContext(ctx context.Context, d *document.Document) error {
+	if b.generation != b.indexer.reindexGeneration.Load() {
+		return errors.New("reindex is in progress")
+	}
+	b.indexer.reindexMu.RLock()
+	defer b.indexer.reindexMu.RUnlock()
+	if b.generation != b.indexer.reindexGeneration.Load() {
+		return errors.New("reindex is in progress")
+	}
+	b.mutationLocked = true
+	defer func() {
+		b.mutationLocked = false
+	}()
 	if err := b.indexer.validateFileDocument(d); err != nil {
 		return err
 	}
@@ -1499,7 +1655,13 @@ func (b *MultiBatch) applyDocumentWrite(d *document.Document, plan documentWrite
 		if b.indexer.embeddingWorkers > 0 {
 			b.embeddingIDs[d.ID()] = struct{}{}
 		} else {
-			_ = embedDocumentChunks(b.indexer.embedCtx, b.indexer, d)
+			embed := embedDocumentChunks
+			if b.mutationLocked {
+				embed = embedDocumentChunksLocked
+			}
+			if err := embed(b.indexer.embedCtx, b.indexer, d); err != nil && b.failOnEmbeddingError {
+				return fmt.Errorf("embed document %s: %w", d.ID(), err)
+			}
 		}
 	}
 	for _, idx := range plan.staleIndexes {
@@ -1522,6 +1684,15 @@ func (b *MultiBatch) applyDocumentWrite(d *document.Document, plan documentWrite
 }
 
 func (b *MultiBatch) Delete(id string) {
+	b.indexer.reindexMu.RLock()
+	defer b.indexer.reindexMu.RUnlock()
+	b.deleteLocked(id)
+}
+
+func (b *MultiBatch) deleteLocked(id string) {
+	if b.generation != b.indexer.reindexGeneration.Load() {
+		return
+	}
 	oldHTMLKeys, oldFaviconKeys := b.indexer.getDocKeysByID(id)
 	delete(b.embeddingIDs, id)
 	b.deletedIDs[id] = struct{}{}
@@ -1533,6 +1704,15 @@ func (b *MultiBatch) Delete(id string) {
 }
 
 func (b *MultiBatch) Save() error {
+	b.indexer.reindexMu.RLock()
+	defer b.indexer.reindexMu.RUnlock()
+	return b.saveLocked()
+}
+
+func (b *MultiBatch) saveLocked() error {
+	if b.generation != b.indexer.reindexGeneration.Load() {
+		return errors.New("reindex is in progress")
+	}
 	for _, entry := range b.batches {
 		if err := entry.index.Batch(entry.batch); err != nil {
 			return err
@@ -1558,6 +1738,8 @@ func (b *MultiBatch) Save() error {
 }
 
 func (i *Indexer) Delete(id string) error {
+	i.reindexMu.RLock()
+	defer i.reindexMu.RUnlock()
 	htmlKeys, faviconKeys := i.getDocKeysByID(id)
 	for _, idx := range i.indexes() {
 		if err := idx.Delete(id); err != nil {
@@ -1582,6 +1764,8 @@ func (i *Indexer) Delete(id string) error {
 }
 
 func (i *Indexer) DeleteByQuery(text string, userID *uint, onDelete func(url string, userID uint)) (int, error) {
+	i.reindexMu.RLock()
+	defer i.reindexMu.RUnlock()
 	q, err := documentMutationQuery(text, userID)
 	if err != nil {
 		return 0, err
@@ -1608,9 +1792,9 @@ func (i *Indexer) DeleteByQuery(text string, userID *uint, onDelete func(url str
 		}
 		batch := newMultiBatch(i)
 		for _, h := range res.Hits {
-			batch.Delete(h.ID)
+			batch.deleteLocked(h.ID)
 		}
-		if err := batch.Save(); err != nil {
+		if err := batch.saveLocked(); err != nil {
 			return count, err
 		}
 		if onDelete != nil {
@@ -1740,6 +1924,7 @@ func (i *Indexer) search(semanticConfig config.SemanticSearch, q *Query) (*Resul
 
 	// Run semantic search if enabled and the embedding infrastructure is available.
 	semanticText := querybuilder.RemoveStandaloneWildcards(expression.Text)
+	i.reindexMu.RLock()
 	if q.SemanticEnabled && i.embedder != nil && i.vectorStore != nil &&
 		strings.TrimSpace(semanticText) != "" {
 		r.SemanticEnabled = true
@@ -1804,6 +1989,7 @@ func (i *Indexer) search(semanticConfig config.SemanticSearch, q *Query) (*Resul
 			}
 		}
 	}
+	i.reindexMu.RUnlock()
 
 	// Bump the total to reflect semantic matches that are not in the
 	// keyword results.

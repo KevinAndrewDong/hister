@@ -85,11 +85,18 @@ func (i *Indexer) startEmbeddingQueue(workers int) error {
 }
 
 func (i *Indexer) stopEmbeddingQueue() {
-	if i.embeddingQueue == nil {
+	i.reindexMu.RLock()
+	queue := i.embeddingQueue
+	i.reindexMu.RUnlock()
+	if queue == nil {
 		return
 	}
-	i.embeddingQueue.Close()
-	i.embeddingQueue = nil
+	queue.Close()
+	i.reindexMu.Lock()
+	if i.embeddingQueue == queue {
+		i.embeddingQueue = nil
+	}
+	i.reindexMu.Unlock()
 }
 
 func (i *Indexer) enqueueEmbedding(docID string) error {

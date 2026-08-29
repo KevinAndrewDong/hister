@@ -3,10 +3,19 @@
 package vectorstore
 
 import (
+	"fmt"
 	"sort"
+	"sync/atomic"
+	"time"
 
 	"github.com/asciimoo/hister/config"
 )
+
+var reindexSequence atomic.Uint64
+
+func nextReindexSuffix() string {
+	return fmt.Sprintf("_reindex_%d_%d", time.Now().UnixNano(), reindexSequence.Add(1))
+}
 
 const (
 	searchCandidateMultiplier = 4
@@ -106,10 +115,25 @@ func diversifySearchResults(results []Result, documentLimit, chunkLimit int) []R
 	return diverse
 }
 
+// ReindexStore is a vector store populated during a reindex. It must be
+// committed only after the replacement search indexes are ready, or rolled
+// back when reindexing fails.
+type ReindexStore interface {
+	VectorStore
+
+	Commit() error
+	Rollback() error
+}
+
 // VectorStore is the interface for vector similarity backends.
 type VectorStore interface {
 	// Init creates tables/extensions if missing. Safe to call on every startup.
 	Init() error
+
+	// BeginReindex creates an isolated store for rebuilding embeddings. The
+	// caller must commit it after the replacement indexes are ready or roll it
+	// back on failure.
+	BeginReindex() (ReindexStore, error)
 
 	// PutChunks upserts all chunk embeddings for a document, replacing any
 	// previous chunks. docID matches the Bleve document ID (URL).
